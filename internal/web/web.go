@@ -317,6 +317,13 @@ const (
 // startTask schedules background jobs (Xray checks, traffic jobs, cron
 // jobs) which the panel relies on for periodic maintenance and monitoring.
 func (s *Server) startTask(restartXray bool, loc *time.Location) {
+	reconcileHysteriaHop := func() {
+		if err := service.ReconcileHysteriaPortHopping(); err != nil {
+			logger.Warning("Hysteria port forwarding reconciliation failed:", err)
+		}
+	}
+	reconcileHysteriaHop()
+	_, _ = s.cron.AddFunc("@every 30s", reconcileHysteriaHop)
 	if restartXray {
 		err := s.xrayService.RestartXray(true)
 		if err != nil {

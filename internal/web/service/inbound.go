@@ -1091,7 +1091,8 @@ func (s *InboundService) normalizeMtprotoXrayPort(inbound *model.Inbound, oldSet
 // It validates port uniqueness, client email uniqueness, and required fields,
 // then saves the inbound to the database and optionally adds it to the running Xray instance.
 // Returns the created inbound, whether Xray needs restart, and any error.
-func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+func (s *InboundService) AddInbound(inbound *model.Inbound) (result *model.Inbound, restart bool, resultErr error) {
+	defer syncHysteriaHopAfterSave(&resultErr, &restart, hasLocalHysteriaHop(inbound))
 	inbound.Id = 0
 	legacyShareAddr := legacyMtprotoShareAddr(inbound)
 	inbound.TrafficResetDay = normalizeTrafficResetDay(inbound.TrafficResetDay)
@@ -1381,13 +1382,14 @@ func (s *InboundService) DelInbound(id int) (bool, error) {
 
 // delInbound deletes the central row and returns the node push instead of running
 // it, so a bulk delete can fan the pushes out once every row is gone.
-func (s *InboundService) delInbound(id int) (bool, func(), error) {
+func (s *InboundService) delInbound(id int) (restart bool, push func(), resultErr error) {
 	db := database.GetDB()
 
 	needRestart := false
 	var postCommitApply, nodePush func()
 	var ib model.Inbound
 	loadErr := db.Model(model.Inbound{}).Where("id = ?", id).First(&ib).Error
+	defer syncHysteriaHopAfterSave(&resultErr, &restart, loadErr == nil && hasLocalHysteriaHop(&ib))
 	if loadErr == nil {
 		shouldPushToRuntime := ib.NodeID != nil || ib.Enable
 		if shouldPushToRuntime {
@@ -1601,28 +1603,29 @@ func (s *InboundService) SetInboundSubSortIndex(id int, index int) error {
 	return nil
 }
 
-func (s *InboundService) SetInboundEnable(id int, enable bool) (bool, error) {
+func (s *InboundService) SetInboundEnable(id int, enable bool) (restart bool, resultErr error) {
 	inbound, err := s.GetInbound(id)
 	if err != nil {
 		return false, err
 	}
+	defer syncHysteriaHopAfterSave(&resultErr, &restart, hasLocalHysteriaHop(inbound))
 	if inbound.Enable == enable {
 		return false, nil
 	}
 
 	db := database.GetDB()
-	// Enabling puts this row's ports into the running config, and the guards ran
-	// only if it was saved: a restored or hand-edited row reaches it unchecked.
-	if enable && inbound.NodeID == nil {
-		conflict, err := checkPortConflictTx(db, inbound, inbound.Id)
-		if err != nil {
-			return false, err
+	candidate := *inbound
+	candidate.Enable = enable
+	if err := runSerializedTx(func(tx *gorm.DB) error {
+		if enable && candidate.NodeID == nil {
+			conflict, err := checkPortConflictTx(tx, &candidate, candidate.Id)
+			if err != nil {
+				return err
+			}
+			if conflict != nil {
+				return common.NewError(conflict.String())
+			}
 		}
-		if conflict != nil {
-			return false, common.NewError(conflict.String())
-		}
-	}
-	if err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(model.Inbound{}).Where("id = ?", id).
 			Update("enable", enable).Error; err != nil {
 			return err
@@ -1685,7 +1688,7 @@ func (s *InboundService) SetInboundEnable(id int, enable bool) (bool, error) {
 	return needRestart, nil
 }
 
-func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+func (s *InboundService) UpdateInbound(inbound *model.Inbound) (result *model.Inbound, restart bool, resultErr error) {
 	legacyShareAddr := legacyMtprotoShareAddr(inbound)
 	inbound.TrafficResetDay = normalizeTrafficResetDay(inbound.TrafficResetDay)
 	// Normalize streamSettings based on protocol
@@ -1747,6 +1750,7 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 	// Restore the stored NodeID before the port-conflict check so a node inbound
 	// stays scoped to its own node (the payload's nodeId is unreliable, often absent).
 	inbound.NodeID = oldInbound.NodeID
+	defer syncHysteriaHopAfterSave(&resultErr, &restart, hasLocalHysteriaHop(inbound) || hasLocalHysteriaHop(oldInbound))
 	// The node assignment is the stored one, so only a protocol change can
 	// introduce one; a row adopted from a node keeps the protocol it arrived with.
 	if inbound.NodeID != nil && inbound.Protocol != oldInbound.Protocol && !isNodeEligibleProtocol(inbound.Protocol) {

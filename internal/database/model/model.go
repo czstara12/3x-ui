@@ -380,6 +380,7 @@ func (i *Inbound) GenXrayInboundConfig() *xray.InboundConfig {
 		if healed, ok := HealHysteriaStreamVersion(streamSettings); ok {
 			streamSettings = healed
 		}
+		streamSettings = stripHysteriaClientHopMask(streamSettings)
 	}
 	return &xray.InboundConfig{
 		Listen:         json_util.RawMessage(listen),
@@ -390,6 +391,35 @@ func (i *Inbound) GenXrayInboundConfig() *xray.InboundConfig {
 		Tag:            i.Tag,
 		Sniffing:       json_util.RawMessage(i.Sniffing),
 	}
+}
+
+func stripHysteriaClientHopMask(raw string) string {
+	var stream map[string]any
+	if json.Unmarshal([]byte(raw), &stream) != nil {
+		return raw
+	}
+	mask, _ := stream["finalmask"].(map[string]any)
+	udp, _ := mask["udp"].([]any)
+	kept := make([]any, 0, len(udp))
+	for _, item := range udp {
+		entry, _ := item.(map[string]any)
+		if entry["type"] != "udphop" {
+			kept = append(kept, item)
+		}
+	}
+	if len(kept) == len(udp) {
+		return raw
+	}
+	if len(kept) == 0 {
+		delete(mask, "udp")
+	} else {
+		mask["udp"] = kept
+	}
+	out, err := json.Marshal(stream)
+	if err != nil {
+		return raw
+	}
+	return string(out)
 }
 
 func StripVmessClientSecurity(settings string) (string, bool) {

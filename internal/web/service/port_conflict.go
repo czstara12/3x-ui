@@ -240,6 +240,9 @@ func (s *InboundService) checkPortConflict(inbound *model.Inbound, ignoreId int)
 }
 
 func checkPortConflictTx(db *gorm.DB, inbound *model.Inbound, ignoreId int) (*portConflictDetail, error) {
+	if err := validateHysteriaHopTx(db, inbound, ignoreId); err != nil {
+		return nil, err
+	}
 	newBits := inboundTransports(inbound.Protocol, inbound.StreamSettings, inbound.Settings)
 
 	// The internal Xray API inbound (tag "api", loopback TCP) isn't a DB row,
